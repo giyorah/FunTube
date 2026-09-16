@@ -1,78 +1,67 @@
-name: Build TizenTube Standalone and Release
-
+name: Package FunTube from upstream release
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream tag (for example v2.0.1), or latest"
+        required: true
+        default: latest
+        type: string
+      publish_release:
+        description: "Publish a release after verification (leave off for a preview)"
+        required: true
+        default: false
+        type: boolean
+  schedule:
+    - cron: '23 */6 * * *'
+
+# Only the release-publishing step gets this repository's token in its environment.
+# No personal tokens or signing certificates are required.
+permissions:
+  contents: write
+
+concurrency:
+  group: funtube-release
+  cancel-in-progress: false
 
 jobs:
-  build:
+  package:
+    # Scheduled publishing stays off until the first preview/release is verified.
+    if: github.repository == 'giyorah/FunTube' && (github.event_name == 'workflow_dispatch' || vars.FUNTUBE_AUTO_RELEASE == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Clone repo with full history and tags
+      - name: Check out FunTube customization
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # fetch full history for tags
-          fetch-tags: true
-      
-      - name: Fetch tags (safety)
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Detect release, customize and verify package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ inputs.upstream_tag || 'latest' }}
+          SHOULD_PUBLISH: ${{ github.event_name == 'schedule' || inputs.publish_release }}
+        shell: bash
         run: |
-          git fetch --tags --force --prune
-      - name: Determine release tag
-        id: version
-        run: |
-          TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
-          if [ -z "$TAG" ]; then
-            echo "No tags found; deriving from config.xml or fallback"
-            if [ -f standalone/config.xml ]; then
-              # Extract version from config.xml's version attribute
-              CFG_VER=$(sed -n 's/.*version="\([^"]*\)".*/\1/p' standalone/config.xml | head -n1)
-              if [ -n "$CFG_VER" ]; then
-                TAG=v$CFG_VER
-              else
-                TAG=v0.0.0-${GITHUB_SHA:0:7}
-              fi
-            else
-              TAG=v0.0.0-${GITHUB_SHA:0:7}
-            fi
+          set -euo pipefail
+          args=(--icon standalone/icon.png --tag "$UPSTREAM_TAG" --output-dir out)
+          if [[ "$SHOULD_PUBLISH" == "true" ]]; then
+            args+=(--publish)
           fi
-          echo "RELEASE_VERSION=$TAG" >> $GITHUB_ENV
+          python build_funtube.py "${args[@]}"
 
-      - name: Install modules, transpile service and build service for DIAL
-        working-directory: service
-        run: |
-          npm install
-          npx rollup -c rollup.config.js
-
-      - name: Install modules, transpile service and build service
-        working-directory: standalone/service
-        run: |
-          npm install
-          npm install -g @vercel/ncc https://github.com/reisxd/tizen.js/tarball/main
-          npm run build
-          rm -rf node_modules
-
-      - name: Prepare Tizen Certificate
-        run: |
-          echo "${{ secrets.TIZEN_AUTHOR_KEY }}" | base64 -d > "${GITHUB_WORKSPACE}/TizenTube-author.p12"
-
-      - name: Build TizenTube
-        working-directory: standalone
-        run: |
-          mkdir release
-          tizenjs build . -t wgt -o release/TizenTube.wgt --author "${GITHUB_WORKSPACE}/TizenTube-author.p12" --authorPwd '${{ secrets.TIZEN_AUTHOR_KEY_PW }}' -p public --ignore node_modules,/.*\.wgt$/,/userwidget/,/release/
-
-      - name: Upload TizenTube package artifact for Old Tizen
+      - name: Save preview and verification files
+        if: success() && hashFiles('out/*.wgt') != ''
         uses: actions/upload-artifact@v4
         with:
-            name: app-${{ github.sha }}-old.wgt
-            path: standalone/release/TizenTube.wgt
-      
-      - name: Release TizenTube Build Results
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ env.RELEASE_VERSION }}
-          target_commitish: ${{ github.sha }}
-          files: |
-            standalone/release/*
+          name: FunTube-package-${{ github.run_id }}
+          path: out/
+          retention-days: 7
+          if-no-files-found: error
