@@ -14,7 +14,7 @@ on:
         default: false
         type: boolean
   schedule:
-    - cron: '23 */6 * * *'
+    - cron: '0 15 * * *'
 
 # Only the release-publishing step gets this repository's token in its environment.
 # No personal tokens or signing certificates are required.
