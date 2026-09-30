@@ -68,7 +68,7 @@ def read_png(path):
     return raw
 
 
-def build(source, icon_path, tag, output_dir, source_url=None, expected_digest=None):
+def build(source, icon_path, tag, output_dir, source_url=None, expected_digest=None, source_asset=None):
     match = re.fullmatch(r"v?(\d+\.\d+\.\d+)", tag)
     require(match, "Expected a stable release tag such as v2.0.1; review new tag formats manually.")
     version = match.group(1)
@@ -153,6 +153,7 @@ def build(source, icon_path, tag, output_dir, source_url=None, expected_digest=N
     output_hash = hashlib.sha256(destination.read_bytes()).hexdigest()
     provenance = {
         "upstream_repository": UPSTREAM, "upstream_tag": tag, "upstream_version": version,
+        "upstream_asset": source_asset or source.name,
         "upstream_release": source_url or f"https://github.com/{UPSTREAM}/releases/tag/{tag}",
         "upstream_wgt_sha256": source_hash, "icon_sha256": hashlib.sha256(icon).hexdigest(),
         "output_sha256": output_hash, "package_id": PACKAGE_ID,
@@ -169,6 +170,62 @@ def build(source, icon_path, tag, output_dir, source_url=None, expected_digest=N
 def remote_release(tag):
     endpoint = f"repos/{UPSTREAM}/releases/latest" if tag == "latest" else f"repos/{UPSTREAM}/releases/tags/{tag}"
     return gh("api", endpoint)
+
+
+def select_asset(release):
+    """Use Old; only historical releases may use the original generic filename."""
+    version = tuple(int(part) for part in release["tag_name"].removeprefix("v").split("."))
+    assets = release.get("assets", [])
+    name = "TizenTubeOld.wgt"
+    if version <= (2, 0, 1) and not any(a["name"] == name for a in assets):
+        name = "TizenTube.wgt"
+    matches = [a for a in assets if a["name"] == name and a["state"] == "uploaded"]
+    available = ", ".join(a["name"] for a in assets) or "none"
+    require(len(matches) == 1,
+            f"{release['tag_name']}: expected exactly one uploaded {name}; found: {available}. "
+            "FunTube follows the Old variant. Review upstream changes before continuing.")
+    return matches[0]
+
+
+def release_notes(release, asset, destination, repository):
+    version = release["tag_name"].removeprefix("v")
+    download = (f"https://github.com/{repository}/releases/download/"
+                f"funtube/{release['tag_name']}/{destination.name}")
+    upstream_notes = (release.get("body") or "").strip()
+    quoted_notes = "\n".join("> " + line for line in upstream_notes.splitlines()) if upstream_notes else (
+        "Upstream did not provide release notes for this version.")
+    return (
+        f"# FunTube {version} is available\n\n"
+        "This update is optional. If your current version works well, you can keep using it. "
+        "Review the upstream release notes below to decide whether to update.\n\n"
+        f"[Download {destination.name}]({download})\n\n"
+        "When you choose to update, follow these steps:\n\n"
+        "1. On the TV, leave **Developer Mode enabled** and set its **Host PC IP** to "
+        "the current local network IP address of the Windows PC running Apps2Samsung.\n"
+        "2. Fully restart the TV, then connect to it from Apps2Samsung.\n"
+        "3. Install the downloaded WGT through **Custom WGT**, using the same certificate "
+        "settings as before and enabling **Overwrite existing version**.\n\n"
+        "After installation, **before opening FunTube**:\n\n"
+        "1. Change the TV's **Developer Mode Host PC IP** back to **127.0.0.1**. "
+        "Leave Developer Mode enabled.\n"
+        "2. Fully restart the TV again.\n"
+        "3. Open FunTube and check that a video plays.\n\n"
+        "Only change the **Developer Mode Host PC IP** during these steps—not the TV's own "
+        "network IP address. Keep 127.0.0.1 set during normal use; it selects our chosen "
+        "debugger/injection playback mode.\n\n"
+        "Switching playback modes can make your settings and sign-in appear missing because "
+        "the modes use separate browser storage. **Overwrite existing version** attempts an "
+        "in-place update, but does not guarantee that settings and sign-in data will be preserved.\n\n"
+        f"[Installation details](https://github.com/{repository}#install-or-update).\n\n"
+        f"Based on [TizenTube {release['tag_name']}]({release['html_url']}), "
+        f"using **{asset['name']}**. The FunTube icon and app identity are preserved, "
+        "and the version matches upstream exactly. Automated package checks passed.\n\n"
+        "## Upstream release notes\n\n"
+        "Copied from the upstream release; these may also describe changes to other variants.\n\n"
+        f"{quoted_notes}\n\n"
+        f"[Upstream source and license](https://github.com/{UPSTREAM}/tree/{release['tag_name']}). "
+        "Build details and checksums are attached as provenance.json and SHA256SUMS.txt.\n"
+    )
 
 
 def run(args):
@@ -194,9 +251,8 @@ def run(args):
                     "Published release is incomplete; inspect it manually.")
             print(f"Already published {publish_tag}; nothing to do.")
             return
-    assets = [a for a in release["assets"] if a["name"] == "TizenTube.wgt" and a["state"] == "uploaded"]
-    require(len(assets) == 1, "Expected exactly one official TizenTube.wgt asset.")
-    asset = assets[0]
+    asset = select_asset(release)
+    print(f"Selected {release['tag_name']} / {asset['name']}")
     require(0 < asset["size"] <= MAX_SIZE, "Unexpected upstream WGT size.")
     require(asset["browser_download_url"].startswith(f"https://github.com/{UPSTREAM}/releases/download/"),
             "Unexpected upstream asset URL.")
@@ -209,22 +265,14 @@ def run(args):
     source = args.output_dir.parent / "TizenTube-upstream.wgt"
     source.write_bytes(contents)
     destination, provenance = build(source, args.icon, tag, args.output_dir,
-                                    release["html_url"], asset.get("digest"))
-    notes = (
-        f"# FunTube {provenance['upstream_version']} is ready to install\n\n"
-        f"Based on [TizenTube {tag}]({release['html_url']}). The package version matches upstream exactly.\n\n"
-        f"Download **{destination.name}**, then use **Custom WGT** in Apps2Samsung to sign and install it "
-        "with the same author certificate as your existing FunTube installation. TV installation is manual.\n\n"
-        "Changes: custom square icon, one icon declaration, FunTube displayed name, and the existing "
-        "FunTube app identity. Original signatures are removed; all other retained files are unchanged.\n\n"
-        "Package checks passed. Playback and icon rendering still need verification on your TV.\n\n"
-        f"Upstream source and license: https://github.com/{UPSTREAM}/tree/{tag}\n"
-        f"Packaging recipe commit: {os.environ.get('GITHUB_SHA', 'local')}\n"
-    )
+                                    release["html_url"], asset.get("digest"), asset["name"])
+    notes = release_notes(release, asset, destination, repository or "giyorah/FunTube")
     (args.output_dir / "release-notes.md").write_text(notes)
     if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(summary, "a") as report:
-            report.write(notes + ("\nPublishing enabled.\n" if args.publish else "\nPreview only: no GitHub Release published.\n"))
+            report.write(notes + ("\nPublishing enabled.\n" if args.publish else
+                "\nPreview only: download from this run's Artifacts section. "
+                "The release download link becomes available after publishing.\n"))
     if not args.publish:
         print("Preview complete; no remote writes performed.")
         return
